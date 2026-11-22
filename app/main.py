@@ -6,7 +6,7 @@ import threading
 from typing import Any, Dict, List
 
 from fastapi import FastAPI
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
@@ -38,9 +38,19 @@ class SubmissionIn(BaseModel):
     actions: List[Dict[str, Any]] = Field(..., min_length=1)
 
 
+class ProofIn(BaseModel):
+    outbound_layer_id: int
+    evidence_ids: List[int] = Field(..., min_length=1)
+
+
 @app.exception_handler(services.ValidationError)
 async def validation_error_handler(_request, exc: services.ValidationError):
     return JSONResponse(status_code=422, content={"error": exc.to_dict()})
+
+
+@app.exception_handler(services.ProofError)
+async def proof_error_handler(_request, exc: services.ProofError):
+    return JSONResponse(status_code=exc.status, content={"error": exc.to_dict()})
 
 
 @app.get("/api/state")
@@ -82,6 +92,47 @@ def api_submissions():
             }
             for row in dbmod.list_submissions(conn)
         ]
+
+
+@app.get("/api/proofs")
+def api_proofs():
+    """校样留档列表（内部可见）+ 按最新入库状态现算的下载资格。"""
+    with _conn_lock:
+        return services.proof_rows(get_conn())
+
+
+@app.post("/api/proofs")
+def api_create_proof(payload: ProofIn):
+    """选外发层位 + 可引用有效依据，仅用所选依据按原规则重算；冲突则停止出件。"""
+    # ProofError 由 exception_handler 按 409/404/422 统一映射
+    with _conn_lock:
+        return services.create_proof(
+            get_conn(), payload.outbound_layer_id, payload.evidence_ids
+        )
+
+
+@app.get("/api/proofs/{proof_id}/csv")
+def api_proof_csv(proof_id: int):
+    """下载前按最新入库状态核对资格；依据更正/撤回后一律 409。"""
+    with _conn_lock:
+        filename, data = services.build_proof_csv(get_conn(), proof_id)
+    return Response(
+        content=data,
+        media_type="text/csv; charset=utf-8",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
+
+
+@app.get("/api/proofs/{proof_id}/csv")
+def api_proof_csv(proof_id: int):
+    """下载前按最新入库状态核对资格；依据更正/撤回后一律 409。"""
+    with _conn_lock:
+        filename, data = services.build_proof_csv(get_conn(), proof_id)
+    return Response(
+        content=data,
+        media_type="text/csv; charset=utf-8",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
 
 
 # --------------------------------------------------------------------------- #

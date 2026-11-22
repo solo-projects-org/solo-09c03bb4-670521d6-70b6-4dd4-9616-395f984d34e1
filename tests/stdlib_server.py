@@ -69,17 +69,52 @@ class Handler(BaseHTTPRequestHandler):
                     {"id": r["id"], "accepted": bool(r["accepted"]), "reason": r["reason"],
                      "created_at": r["created_at"], "detail": services._safe_json(r["detail"])}
                     for r in rows])
+        elif path == "/api/proofs":
+            with DB_LOCK:
+                self._send(200, services.proof_rows(conn))
+        elif path.startswith("/api/proofs/") and path.endswith("/csv"):
+            try:
+                proof_id = int(path[len("/api/proofs/"):-len("/csv")])
+            except ValueError:
+                self._send(404, {"error": "not found"})
+                return
+            try:
+                with DB_LOCK:
+                    filename, data = services.build_proof_csv(conn, proof_id)
+                self.send_response(200)
+                self.send_header("Content-Type", "text/csv; charset=utf-8")
+                self.send_header("Content-Disposition", f'attachment; filename="{filename}"')
+                self.send_header("Content-Length", str(len(data)))
+                self.end_headers()
+                self.wfile.write(data)
+            except services.ProofError as exc:
+                self._send(exc.status, {"error": exc.to_dict()})
         else:
             self._send(404, {"error": "not found"})
 
     def do_POST(self):
         path = self.path.split("?", 1)[0]
-        if path != "/api/submissions":
+        if path not in ("/api/submissions", "/api/proofs"):
             self._send(404, {"error": "not found"})
             return
         try:
             length = int(self.headers.get("Content-Length", "0"))
             payload = json.loads(self.rfile.read(length).decode("utf-8"))
+            if path == "/api/proofs":
+                try:
+                    outbound = int(payload.get("outbound_layer_id"))
+                    evids = payload.get("evidence_ids")
+                    if not isinstance(evids, list) or not evids:
+                        raise ValueError
+                except (TypeError, ValueError):
+                    self._send(422, {"error": {
+                        "code": "bad_proof_request",
+                        "message": "需要 outbound_layer_id 与非空 evidence_ids 数组"}})
+                    return
+                with DB_LOCK:
+                    result = services.create_proof(conn, outbound, evids)
+                self._send(200, result)
+                return
             actions = payload.get("actions")
             if not isinstance(actions, list) or not actions:
                 self._send(422, {"error": {"code": "empty_submission",
@@ -88,6 +123,8 @@ class Handler(BaseHTTPRequestHandler):
             with DB_LOCK:
                 result = services.submit(conn, actions)
             self._send(200 if result["accepted"] else 409, result)
+        except services.ProofError as exc:
+            self._send(exc.status, {"error": exc.to_dict()})
         except services.ValidationError as exc:
             self._send(422, {"error": exc.to_dict()})
         except json.JSONDecodeError as exc:

@@ -33,6 +33,16 @@ def check(cond, msg):
     print("  ok -", msg)
 
 
+def call_raw(path):
+    """GET 原始响应（CSV 下载用）；返回 (status, headers, bytes)。"""
+    req = urllib.request.Request(BASE + path, method="GET")
+    try:
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            return resp.status, resp.headers, resp.read()
+    except urllib.error.HTTPError as e:
+        return e.code, e.headers, e.read()
+
+
 def main():
     print("[H1] 静态页面与资源可访问")
     with urllib.request.urlopen(BASE + "/", timeout=10) as r:
@@ -178,8 +188,60 @@ def main():
     check(any(s["accepted"] is False for s in subs), "流水中含驳回记录")
     check(any(s["accepted"] for s in subs), "流水中含通过记录")
 
-    print("\nHTTP 级自测全部通过。")
+    print("[H8] 校样：只用所选依据、下载、依据更正后失格、无关改动不影响")
+    state = call("GET", "/api/state")[1]
+    ids = {x["code"]: x["id"] for x in state["layers"]}
+    ev = {(e["note"] or ""): e["id"] for e in state["evidence"]}
+    h1_date = [e["id"] for e in state["evidence"]
+               if e["kind"] == "datum" and e["layer_id"] == ids["H1"]][0]
+    # 只选 H1 的一条测年：不受叠压/登记约束，区间应与全表不同
+    code, p = call("POST", "/api/proofs", {
+        "outbound_layer_id": ids["H1"], "evidence_ids": [h1_date]}, expect=200)
+    check(p["eligible"], "校样生成后可下载")
+    proof_id = p["id"]
+    code, headers, body = call_raw(f"/api/proofs/{proof_id}/csv")
+    check(code == 200 and "text/csv" in headers.get("Content-Type", ""),
+          f"CSV 下载 200: {code} {headers.get('Content-Type')}")
+    text = body.decode("utf-8-sig")
+    check("层位编号" in text and "H1" in text, "CSV 含所选层位编号")
+    check("可行年份区间" in text, "CSV 含可行年份区间列")
 
+    # 选用未激活的叠压关系 -> 422（两方层位须入选的规则另在服务层测试）
+    code, err = call("POST", "/api/proofs", {
+        "outbound_layer_id": ids["H1"], "evidence_ids": []}, expect=422)
+    check(err["error"]["code"] == "bad_proof_request", f"空依据被拒: {err['error']['code']}")
+
+    # 无关依据更正 -> 仍可下载
+    other = [e["id"] for e in call("GET", "/api/state")[1]["evidence"]
+             if e["kind"] == "datum" and e["layer_id"] == ids["H3"]][0]
+    code, r = call("POST", "/api/submissions", {"actions": [
+        {"action": "correct_dating", "evidence_id": other,
+         "lower_year": -930, "upper_year": -800, "note": "H3 复测"}]}, expect=200)
+    check(r["accepted"], "无关依据更正通过")
+    code, _, _ = call_raw(f"/api/proofs/{proof_id}/csv")
+    check(code == 200, "无关依据更正后校样仍可下载")
+
+    # 所选依据更正 -> 409
+    code, r = call("POST", "/api/submissions", {"actions": [
+        {"action": "correct_dating", "evidence_id": h1_date,
+         "lower_year": -1200, "upper_year": -1100, "note": "H1 复测"}]}, expect=200)
+    check(r["accepted"], "所选依据更正通过")
+    code, _, body = call_raw(f"/api/proofs/{proof_id}/csv")
+    check(code == 409 and json.loads(body)["error"]["code"] == "proof_ineligible",
+          "所选依据更正后下载 409")
+    code, proofs = call("GET", "/api/proofs", expect=200)
+    row = [x for x in proofs if x["id"] == proof_id][0]
+    check(not row["eligible"], "校样列表中标记失格")
+
+    # 改回原值 -> 仍不可下载
+    code, r = call("POST", "/api/submissions", {"actions": [
+        {"action": "correct_dating", "evidence_id": h1_date,
+         "lower_year": -1250, "upper_year": -1150, "note": "H1 复测改回"}]}, expect=200)
+    check(r["accepted"], "所选依据改回原值通过")
+    code, _, _ = call_raw(f"/api/proofs/{proof_id}/csv")
+    check(code == 409, "改回原值后仍不可下载（版本已前进）")
+
+    print("\nHTTP 级自测全部通过。")
 
 if __name__ == "__main__":
     main()

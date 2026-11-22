@@ -37,6 +37,9 @@ CREATE TABLE IF NOT EXISTS evidence (
     upper_year  INTEGER,
     note        TEXT NOT NULL DEFAULT '',
     active      INTEGER NOT NULL DEFAULT 1,
+    -- 版本号：每次更正/撤回 +1。校样记录生成时所用依据的版本，
+    -- 下载前比对版本即可发现“更正后又改回原值”的情况。
+    version     INTEGER NOT NULL DEFAULT 1,
     created_at  TEXT NOT NULL,
     withdrawn_at TEXT
 );
@@ -61,7 +64,22 @@ CREATE TABLE IF NOT EXISTS submission (
     detail      TEXT NOT NULL DEFAULT '{}',
     created_at  TEXT NOT NULL
 );
+
+-- 外发校样（proof）：只在内部留档，不参与编年约束求解。
+-- 依据快照记录生成时所用的依据与版本；资格在读时按当前库现算，
+-- 因此依据一旦更正/撤回，校样立即不可下载，无需后台任务改写记录。
+CREATE TABLE IF NOT EXISTS proof (
+    id             INTEGER PRIMARY KEY AUTOINCREMENT,
+    outbound_layer_id INTEGER NOT NULL REFERENCES layer(id),
+    payload        TEXT NOT NULL DEFAULT '{}',
+    created_at     TEXT NOT NULL
+);
 """
+
+# 旧库补列（CREATE TABLE IF NOT EXISTS 不会给既有表加列）。
+_MIGRATIONS = (
+    ("evidence", "version", "INTEGER NOT NULL DEFAULT 1"),
+)
 
 
 def now_iso() -> str:
@@ -81,6 +99,10 @@ def connect(db_path: str) -> sqlite3.Connection:
 
 def init_db(conn: sqlite3.Connection) -> None:
     conn.executescript(SCHEMA)
+    for table, column, decl in _MIGRATIONS:
+        cols = {row["name"] for row in conn.execute(f"PRAGMA table_info({table})")}
+        if column not in cols:
+            conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {decl}")
 
 
 # --------------------------------------------------------------------------- #
@@ -130,6 +152,14 @@ def list_submissions(conn: sqlite3.Connection, limit: int = 50) -> List[sqlite3.
     ).fetchall()
 
 
+def list_proofs(conn: sqlite3.Connection) -> List[sqlite3.Row]:
+    return conn.execute("SELECT * FROM proof ORDER BY id DESC").fetchall()
+
+
+def get_proof(conn: sqlite3.Connection, proof_id: int) -> Optional[sqlite3.Row]:
+    return conn.execute("SELECT * FROM proof WHERE id = ?", (proof_id,)).fetchone()
+
+
 # --------------------------------------------------------------------------- #
 # 写入（均假定已在事务中）
 # --------------------------------------------------------------------------- #
@@ -165,7 +195,7 @@ def insert_superposition(
 
 def deactivate_evidence(conn: sqlite3.Connection, evidence_id: int) -> None:
     conn.execute(
-        "UPDATE evidence SET active=0, withdrawn_at=? WHERE id=?",
+        "UPDATE evidence SET active=0, version=version+1, withdrawn_at=? WHERE id=?",
         (now_iso(), evidence_id),
     )
 
@@ -196,5 +226,14 @@ def insert_submission(conn: sqlite3.Connection, accepted: bool, reason: str,
         "INSERT INTO submission(accepted, reason, detail, created_at) "
         "VALUES (?, ?, ?, ?)",
         (1 if accepted else 0, reason, json.dumps(detail, ensure_ascii=False), now_iso()),
+    )
+    return int(cur.lastrowid)
+
+
+def insert_proof(conn: sqlite3.Connection, outbound_layer_id: int,
+                 payload: Dict[str, Any]) -> int:
+    cur = conn.execute(
+        "INSERT INTO proof(outbound_layer_id, payload, created_at) VALUES (?, ?, ?)",
+        (outbound_layer_id, json.dumps(payload, ensure_ascii=False), now_iso()),
     )
     return int(cur.lastrowid)

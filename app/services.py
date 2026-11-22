@@ -8,6 +8,9 @@
 """
 from __future__ import annotations
 
+import csv
+import io
+import json
 import sqlite3
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
@@ -22,6 +25,25 @@ VALID_ACTIONS = {
     "add_registration", "replace_registration", "withdraw_registration",
     "withdraw_with",
 }
+
+# 校样资格：这些状态的原因说明
+PROOF_INACTIVE_REASON = "所引依据已更正或撤回（或曾被更正后又改回原值），校样作废"
+
+
+class ProofError(Exception):
+    """校样类错误（HTTP 层映射为 409/404/422）。"""
+
+    def __init__(self, status: int, code: str, message: str, detail: Optional[dict] = None):
+        super().__init__(message)
+        self.status = status
+        self.code = code
+        self.message = message
+        self.detail = detail or {}
+
+    def to_dict(self) -> dict:
+        d = {"code": self.code, "message": self.message}
+        d.update(self.detail)
+        return d
 
 
 class ValidationError(Exception):
@@ -60,6 +82,7 @@ class EvidenceRec:
     upper_year: Optional[int]
     note: str
     active: bool = True
+    version: int = 1               # 每次更正/撤回 +1（校样资格核对用）
 
 
 @dataclass
@@ -146,7 +169,7 @@ def load_snapshot(conn: sqlite3.Connection) -> Snapshot:
         snap.evidence[row["id"]] = EvidenceRec(
             row["id"], row["kind"], row["layer_id"], row["layer2_id"],
             row["lower_year"], row["upper_year"], row["note"],
-            active=bool(row["active"]),
+            active=bool(row["active"]), version=row["version"],
         )
     for row in conn.execute("SELECT * FROM registration").fetchall():
         snap.registrations[row["id"]] = RegistrationRec(
@@ -394,8 +417,9 @@ def persist(conn: sqlite3.Connection, snap: Snapshot, actions: List[dict]) -> No
                 dbmod.deactivate_evidence(conn, eid)
             else:
                 conn.execute(
-                    "UPDATE evidence SET active=1, withdrawn_at=NULL, "
-                    "lower_year=?, upper_year=?, layer_id=?, layer2_id=?, note=? WHERE id=?",
+                    "UPDATE evidence SET active=1, version=version+1, "
+                    "withdrawn_at=NULL, lower_year=?, upper_year=?, layer_id=?, "
+                    "layer2_id=?, note=? WHERE id=?",
                     (rec.lower_year, rec.upper_year, rec.layer_id, rec.layer2_id, rec.note, eid),
                 )
         elif (row["lower_year"], row["upper_year"], row["layer_id"],
@@ -404,7 +428,7 @@ def persist(conn: sqlite3.Connection, snap: Snapshot, actions: List[dict]) -> No
         ):
             conn.execute(
                 "UPDATE evidence SET lower_year=?, upper_year=?, layer_id=?, "
-                "layer2_id=?, note=? WHERE id=?",
+                "layer2_id=?, note=?, version=version+1 WHERE id=?",
                 (rec.lower_year, rec.upper_year, rec.layer_id, rec.layer2_id, rec.note, eid),
             )
 
@@ -575,6 +599,7 @@ def full_state(conn: sqlite3.Connection) -> dict:
                 "id": e.id, "kind": e.kind, "layer_id": e.layer_id,
                 "layer2_id": e.layer2_id, "lower_year": e.lower_year,
                 "upper_year": e.upper_year, "note": e.note, "active": e.active,
+                "version": e.version,
             }
             for e in sorted(snap.evidence.values(), key=lambda r: r.id)
         ],
@@ -598,8 +623,221 @@ def full_state(conn: sqlite3.Connection) -> dict:
 
 
 def _safe_json(text: str) -> Any:
-    import json
     try:
         return json.loads(text)
     except (TypeError, ValueError):
         return {}
+
+
+# --------------------------------------------------------------------------- #
+# 外发校样（proof）
+#
+# 只取所选层位、所选有效依据，按与编年表完全相同的规则重算；登记不进入校样，
+# 也不影响校样结果。校样记录在内部留档（proof 表），依据快照含版本号；
+# 每次读取/下载都按当前库现算资格——依据发生任何更正或撤回（哪怕之后改回原值）
+# 版本号都会前进，从而永久失去下载资格；登记及其它依据的改动不影响。
+# --------------------------------------------------------------------------- #
+def _proof_snapshot(conn: sqlite3.Connection) -> Snapshot:
+    """一次性读取当前库的台账快照，保证生成时“同一份已入库台账”取数。"""
+    return load_snapshot(conn)
+
+
+def _active_evidence(snap: Snapshot, eid: int) -> EvidenceRec:
+    ev = snap.evidence.get(eid)
+    if ev is None:
+        raise ProofError(422, "unknown_evidence", f"依据 {eid} 不存在")
+    if not ev.active:
+        raise ProofError(422, "evidence_inactive", f"依据 {eid} 已撤回，不可选为校样依据")
+    return ev
+
+
+def _solve_selected(snap: Snapshot, outbound_layer_id: int,
+                    evidence_ids: List[int]) -> dict:
+    """只用所选层位与所选依据，按原规则（测年并集、叠压严格早于）重算。"""
+    outbound = snap.layers.get(outbound_layer_id)
+    if outbound is None:
+        raise ProofError(422, "unknown_layer", f"外发层位 {outbound_layer_id} 不存在")
+
+    selected: List[EvidenceRec] = []
+    seen = set()
+    for eid in evidence_ids:
+        if eid in seen:
+            continue
+        seen.add(eid)
+        selected.append(_active_evidence(snap, eid))
+
+    # “入选层位”= 外发层位 + 所选测年依据所属层位。
+    layer_ids = {outbound_layer_id}
+    for ev in selected:
+        if ev.kind == "datum":
+            layer_ids.add(ev.layer_id)
+
+    # 叠压依据涉及的两个层位都须入选，否则该依据不能引用。
+    for ev in selected:
+        if ev.kind == "superposition":
+            missing = [lid for lid in (ev.layer_id, ev.layer2_id) if lid not in layer_ids]
+            if missing:
+                raise ProofError(
+                    422, "superposition_layer_not_selected",
+                    f"叠压依据 {ev.id} 涉及的两个层位都须入选；"
+                    f"层位 {', '.join(str(m) for m in missing)} 尚未入选",
+                    {"evidence_id": ev.id, "missing_layer_ids": missing},
+                )
+
+    if not selected:
+        raise ProofError(
+            422, "no_evidence", "请至少选择一条有效测年或叠压依据；无依据的层位校样无意义"
+        )
+
+    datum_pieces: Dict[int, List[Tuple[int, int]]] = {lid: [] for lid in layer_ids}
+    edges: List[Tuple[int, int, int]] = []
+    for ev in selected:
+        if ev.kind == "datum":
+            datum_pieces[ev.layer_id].append((ev.lower_year, ev.upper_year))
+        else:
+            edges.append((ev.layer_id, ev.layer2_id, ev.id))
+
+    # 与编年表一致：有测年依据取候选并集；无任何测年依据的层位取有效年份全域。
+    # 校样不使用登记，因此不做登记交运算。
+    raw_domains: Dict[int, solver.Domain] = {}
+    full_domain: solver.Domain = [(solver.YEAR_MIN, solver.YEAR_MAX)]
+    for lid in layer_ids:
+        raw_domains[lid] = (
+            solver.normalize(datum_pieces[lid]) if datum_pieces[lid] else list(full_domain)
+        )
+
+    result = solver.solve(sorted(layer_ids), raw_domains, edges)
+    out = dict(result)
+    out["outbound_layer"] = outbound
+    out["selected_evidence"] = selected
+    out["layer_ids"] = sorted(layer_ids)
+    return out
+
+
+def _evidence_refs(snap: Snapshot, selected: List[EvidenceRec]) -> List[dict]:
+    """生成时所用依据的完整快照 + 版本号（内部留档，含所有依据详情）。"""
+    refs = []
+    for ev in selected:
+        refs.append({
+            "id": ev.id,
+            "kind": ev.kind,
+            "layer_id": ev.layer_id,
+            "layer2_id": ev.layer2_id,
+            "lower_year": ev.lower_year,
+            "upper_year": ev.upper_year,
+            "note": ev.note,
+            "version": ev.version,
+        })
+    return refs
+
+
+def create_proof(conn: sqlite3.Connection, outbound_layer_id: int,
+                 evidence_ids: List[int]) -> dict:
+    """生成校样并内部留档；无法同时成立时返回冲突、不落库。"""
+    if not isinstance(evidence_ids, list):
+        raise ProofError(422, "bad_evidence_list", "evidence_ids 必须是数组")
+    try:
+        ids = [int(x) for x in evidence_ids]
+    except (TypeError, ValueError):
+        raise ProofError(422, "bad_evidence_ref", "依据 id 必须是整数")
+    try:
+        outbound_id = int(outbound_layer_id)
+    except (TypeError, ValueError):
+        raise ProofError(422, "bad_layer_ref", "外发层位 id 必须是整数")
+
+    # 读快照与写入留档放在同一事务内：生成时按同一份已入库台账取数与重算。
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        snap = _proof_snapshot(conn)
+        solved = _solve_selected(snap, outbound_id, ids)
+        if not solved["satisfiable"]:
+            raise ProofError(
+                409, "unsatisfiable",
+                "所选依据无法同时成立，本次停止出件",
+                {"conflict": _decorate_conflict(snap, solved["conflict"])},
+            )
+
+        payload = {
+            "outbound_layer_id": outbound_id,
+            "evidence": _evidence_refs(snap, solved["selected_evidence"]),
+            "layer_ids": solved["layer_ids"],
+            "domains": {str(k): v for k, v in solved["domains"].items()},
+        }
+        proof_id = dbmod.insert_proof(conn, outbound_id, payload)
+        conn.execute("COMMIT")
+    except Exception:
+        conn.execute("ROLLBACK")
+        raise
+    return _proof_view(snap, payload, dbmod.get_proof(conn, proof_id))
+
+
+def proof_rows(conn: sqlite3.Connection) -> List[dict]:
+    snap = load_snapshot(conn)
+    return [
+        _proof_view(snap, _safe_json(row["payload"]) or {}, row)
+        for row in dbmod.list_proofs(conn)
+    ]
+
+
+def _proof_eligibility(snap: Snapshot, payload: dict) -> dict:
+    """按当前库核对校样是否仍可下载。返回 eligible + 失效依据明细。"""
+    invalid = []
+    for ref in payload.get("evidence", []):
+        ev = snap.evidence.get(ref["id"])
+        if ev is None:
+            invalid.append({"id": ref["id"], "reason": "依据已不存在"})
+        elif not ev.active:
+            invalid.append({"id": ref["id"], "reason": "依据已撤回"})
+        elif ev.version != ref["version"]:
+            invalid.append({"id": ref["id"], "reason": "依据已更正（含更正后又改回原值）"})
+    return {"eligible": not invalid, "invalid_evidence": invalid, "reason": None if not invalid else PROOF_INACTIVE_REASON}
+
+
+def _proof_view(snap: Snapshot, payload: dict, row: sqlite3.Row) -> dict:
+    elig = _proof_eligibility(snap, payload)
+    outbound_id = payload["outbound_layer_id"]
+    layer = snap.layers.get(outbound_id)
+    return {
+        "id": row["id"],
+        "outbound_layer_id": outbound_id,
+        "outbound_layer_code": layer.code if layer else None,
+        "created_at": row["created_at"],
+        "eligible": elig["eligible"],
+        "reason": elig["reason"],
+        "invalid_evidence": elig["invalid_evidence"],
+        "selected_evidence": payload.get("evidence", []),
+    }
+
+
+def build_proof_csv(conn: sqlite3.Connection, proof_id: int) -> Tuple[str, bytes]:
+    """下载前按最新入库状态核对资格；合格则只用生成时所选依据与区间出件。"""
+    snap = load_snapshot(conn)
+    row = dbmod.get_proof(conn, proof_id)
+    if row is None:
+        raise ProofError(404, "proof_not_found", f"校样 {proof_id} 不存在")
+    payload = _safe_json(row["payload"]) or {}
+    elig = _proof_eligibility(snap, payload)
+    if not elig["eligible"]:
+        raise ProofError(
+            409, "proof_ineligible", PROOF_INACTIVE_REASON,
+            {"invalid_evidence": elig["invalid_evidence"]},
+        )
+
+    outbound_id = payload["outbound_layer_id"]
+    layer = snap.layers.get(outbound_id)
+    domains = {int(k): v for k, v in (payload.get("domains") or {}).items()}
+    buf = io.StringIO()
+    writer = csv.writer(buf, lineterminator="\n")
+    writer.writerow(["层位编号", "层位ID", "可行年份区间", "区间数", "空档数"])
+    for lid in payload.get("layer_ids", [outbound_id]):
+        lrec = snap.layers.get(lid)
+        code = lrec.code if lrec else f"#{lid}"
+        ivs = domains.get(lid, [])
+        text = "；".join(
+            (str(lo) if lo == hi else f"{lo} ~ {hi}") for lo, hi in ivs
+        ) or "无可行年份"
+        writer.writerow([code, lid, text, len(ivs), max(0, len(ivs) - 1)])
+    data = ("﻿" + buf.getvalue()).encode("utf-8")  # 开头 BOM 便于表格软件识别 UTF-8
+    safe_code = (layer.code if layer else "layer").replace("/", "_").replace("\\", "_")
+    filename = f"proof-{proof_id}-{safe_code}.csv"
+    return filename, data

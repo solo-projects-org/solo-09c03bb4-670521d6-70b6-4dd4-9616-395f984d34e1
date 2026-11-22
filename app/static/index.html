@@ -40,6 +40,16 @@
   details { margin-top:8px; }
   summary { cursor:pointer; font-size:13px; }
   .row2 { display:grid; grid-template-columns:1fr 1fr; gap:8px; }
+  .evpick { display:flex; gap:8px; align-items:flex-start; padding:4px 0;
+            border-bottom:1px dashed var(--bd); font-size:13px; }
+  .evpick input { width:auto; margin-top:3px; }
+  .evpick .meta { color:var(--mut); font-size:12px; }
+  .evpick.disabled { opacity:.55; }
+  #proof-out { margin-top:12px; display:none; }
+  #proof-out.show { display:block; }
+  #proof-out .conflict { background:#ffebe9; border:1px solid #ff8182;
+        border-radius:8px; padding:10px 12px; font-size:13px; white-space:pre-wrap; }
+  .proof-item td { vertical-align:middle; }
 </style>
 </head>
 <body>
@@ -88,7 +98,34 @@
   <tr><th>ID</th><th>层位</th><th>区间</th><th>备注</th><th>状态</th><th>替代为</th></tr>
   </thead><tbody></tbody></table></details>
 
-<h2>④ 提交流水</h2>
+<h2>④ 外发校样（仅所选依据，按原规则重算；登记不参与）</h2>
+<div class="grid">
+  <div class="card">
+    <h3>1. 选择外发层位</h3>
+    <label>外发层位</label>
+    <select id="proof-layer"></select>
+    <p class="muted" style="margin-top:8px">
+      校样只采用下方勾选的有效测年与叠压依据；登记（拟采用区间）留在内部，不影响校样结果。
+    </p>
+  </div>
+  <div class="card">
+    <h3>2. 勾选可引用的有效依据</h3>
+    <div id="proof-evidence" class="muted">（加载中）</div>
+    <p class="muted" style="margin-top:8px">
+      叠压依据涉及的两个层位都须入选（外发层位或已勾中的依据两侧），否则无法勾选。
+    </p>
+    <button onclick="reloadProofEvidence()" class="secondary">按当前选择刷新可勾选项</button>
+    <button onclick="generateProof()">生成校样</button>
+  </div>
+</div>
+<div id="proof-out"></div>
+
+<h3 style="font-size:14px;margin:18px 0 8px">校样留档与下载</h3>
+<table id="proof-table"><thead>
+  <tr><th>#</th><th>外发层位</th><th>所用依据</th><th>生成时间(UTC)</th><th>下载资格</th><th>CSV</th></tr>
+</thead><tbody></tbody></table>
+
+<h2>⑤ 提交流水</h2>
 <table id="sub-table"><thead>
   <tr><th>#</th><th>结果</th><th>原因</th><th>时间(UTC)</th><th>详情</th></tr>
 </thead><tbody></tbody></table>

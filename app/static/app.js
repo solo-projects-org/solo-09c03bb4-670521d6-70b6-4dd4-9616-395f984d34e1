@@ -278,6 +278,234 @@ async function refresh() {
   const resp = await fetch("/api/state");
   state = await resp.json();
   render();
+  renderProofLayerSelect();
+  await refreshProofs();
+}
+
+/* ------------------------------------------------------------------ */
+/* 外发校样                                                            */
+/* ------------------------------------------------------------------ */
+
+function activeEvidence() {
+  return (state.evidence || []).filter((e) => e.active);
+}
+
+function selectedOutboundLayer() {
+  return Number($("proof-layer").value);
+}
+
+function checkedEvidenceIds() {
+  return Array.from(
+    document.querySelectorAll("#proof-evidence input[type=checkbox]:checked")
+  ).map((el) => Number(el.value));
+}
+
+// “入选层位”= 外发层位 + 已勾选测年依据所属层位。
+function selectedLayers() {
+  const ids = new Set([selectedOutboundLayer()]);
+  const byId = new Map(activeEvidence().map((e) => [e.id, e]));
+  for (const eid of checkedEvidenceIds()) {
+    const ev = byId.get(eid);
+    if (ev && ev.kind === "datum") ids.add(ev.layer_id);
+  }
+  return ids;
+}
+
+function proofEvidenceLine(e) {
+  const isDatum = e.kind === "datum";
+  const range = isDatum ? `${fmtYear(e.lower_year)} ~ ${fmtYear(e.upper_year)}` : "严格早于";
+  const rel = isDatum
+    ? layerCode(e.layer_id)
+    : `${layerCode(e.layer_id)} → ${layerCode(e.layer2_id)}`;
+  return `<div class="meta">${isDatum ? "测年" : "叠压"} · ${rel} · ${range}${
+    e.note ? " · " + e.note : ""}</div>`;
+}
+
+function reloadProofEvidence() {
+  const box = $("proof-evidence");
+  if (!state || !state.layers || state.layers.length === 0) {
+    box.innerHTML = '<span class="muted">尚无层位，请先在②提交层位与依据。</span>';
+    return;
+  }
+  const outbound = selectedOutboundLayer();
+  if (!outbound) {
+    box.innerHTML = '<span class="muted">请先选择外发层位。</span>';
+    return;
+  }
+  const evs = activeEvidence();
+  if (evs.length === 0) {
+    box.innerHTML = '<span class="muted">当前没有有效依据可引用。</span>';
+    return;
+  }
+  const layers = selectedLayers();
+  const keep = new Set(checkedEvidenceIds());
+  const chosen = evs.filter((e) => keep.has(e.id));
+  // 重新计算“入选层位”时已勾选项也会扩展，迭代到稳定，保证联动勾选不会突兀失效。
+  let grew = true;
+  while (grew) {
+    grew = false;
+    for (const e of chosen) {
+      if (e.kind === "datum" && !layers.has(e.layer_id)) {
+        layers.add(e.layer_id);
+        grew = true;
+      }
+    }
+  }
+
+  box.innerHTML = evs.map((e) => {
+    const missing = [];
+    if (e.kind === "superposition") {
+      if (!layers.has(e.layer_id)) missing.push(e.layer_id);
+      if (!layers.has(e.layer2_id)) missing.push(e.layer2_id);
+    }
+    const disabled = missing.length > 0;
+    // 因层位不再入选而失效的勾选一并清掉，避免提交后被服务端拒绝。
+    const checked = !disabled && keep.has(e.id);
+    const note = disabled
+      ? `<div class="meta" style="color:#cf222e">两端层位都须入选：尚缺 ${
+          missing.map((id) => layerCode(id)).join("、")}</div>`
+      : "";
+    return `<label class="evpick ${disabled ? "disabled" : ""}">
+      <input type="checkbox" value="${e.id}" ${checked ? "checked" : ""}
+             ${disabled ? "disabled" : ""} onchange="reloadProofEvidence()">
+      <div><b>#${e.id}</b> ${e.kind === "datum" ? "测年" : "叠压"}${
+        e.note ? " · " + e.note : ""}${proofEvidenceLine(e)}${note}</div>
+    </label>`;
+  }).join("");
+}
+
+function onProofLayerChange() {
+  // 换外发层位后“入选层位”集合变化，清空勾选从头来，避免残留不可引用项。
+  $("proof-evidence").querySelectorAll("input[type=checkbox]").forEach((el) => {
+    el.checked = false;
+  });
+  reloadProofEvidence();
+}
+
+function renderProofLayerSelect() {
+  const sel = $("proof-layer");
+  if (!state || !state.layers) return;
+  const prev = sel.value;
+  sel.innerHTML = state.layers
+    .map((l) => `<option value="${l.id}">${l.code}（#${l.id}）${l.name ? " · " + l.name : ""}</option>`)
+    .join("");
+  if (prev && state.layers.some((l) => String(l.id) === prev)) sel.value = prev;
+  sel.onchange = onProofLayerChange;
+  reloadProofEvidence();
+}
+
+function renderProofMsg(kind, html) {
+  const out = $("proof-out");
+  out.className = "show";
+  out.innerHTML = kind === "err"
+    ? `<div class="conflict">${html}</div>`
+    : `<div class="card">${html}</div>`;
+}
+
+async function generateProof() {
+  const outbound = selectedOutboundLayer();
+  const ids = checkedEvidenceIds();
+  if (!outbound) {
+    renderProofMsg("err", "请先选择外发层位。");
+    return;
+  }
+  if (ids.length === 0) {
+    renderProofMsg("err", "请至少勾选一条可引用的有效依据。");
+    return;
+  }
+  try {
+    const resp = await fetch("/api/proofs", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ outbound_layer_id: outbound, evidence_ids: ids }),
+    });
+    const data = await resp.json();
+    if (resp.ok) {
+      renderProofMsg("ok",
+        `校样 #${data.id} 已生成（内部留档）。\n外发层位：${data.outbound_layer_code}\n`
+        + `所用依据：${data.selected_evidence.map((e) => "#" + e.id).join("、")}\n`
+        + `可在下方“校样留档与下载”下载 CSV。`);
+    } else if (resp.status === 409 && data.error && data.error.code === "unsatisfiable") {
+      const c = data.error.conflict || {};
+      const ev = (c.evidence || []).map((e) => `#${e.id}(${e.kind})`).join("、");
+      let txt = `所选依据无法同时成立，本次停止出件（未生成校样）。\n`
+        + `冲突层位：${c.layer_code || c.layer_id}\n`
+        + `原因：${c.reason}\n`
+        + `涉及依据：${ev || "（无向关联依据，多为测年候选不相交）"}`;
+      if (c.cycle_layer_codes) txt += `\n环路径：${c.cycle_layer_codes.join(" → ")}`;
+      renderProofMsg("err", txt);
+    } else {
+      const err = (data.error || data);
+      renderProofMsg("err", "校样请求失败：" + (err.message || JSON.stringify(err)));
+    }
+  } catch (e) {
+    renderProofMsg("err", "请求失败：" + e.message);
+  }
+  await refreshProofs();
+}
+
+async function refreshProofs() {
+  let rows = [];
+  try {
+    const resp = await fetch("/api/proofs");
+    rows = await resp.json();
+  } catch (e) {
+    return;
+  }
+  const tbody = $("proof-table").querySelector("tbody");
+  if (!rows.length) {
+    tbody.innerHTML = '<tr><td colspan="6" class="muted">暂无校样。</td></tr>';
+    return;
+  }
+  tbody.innerHTML = rows.map((p) => {
+    const evs = (p.selected_evidence || []).map((e) => `#${e.id}`).join("、");
+    const st = p.eligible
+      ? '<span class="tag ok">可下载</span>'
+      : `<span class="tag bad">已失格</span><div class="muted">${
+          (p.invalid_evidence || []).map((x) => `#${x.id} ${x.reason}`).join("；")}</div>`;
+    const dl = p.eligible
+      ? `<a class="tag ok" href="/api/proofs/${p.id}/csv"
+            onclick="downloadProof(event, ${p.id})">下载 CSV</a>`
+      : '<span class="muted">不可下载</span>';
+    return `<tr class="proof-item">
+      <td>${p.id}</td>
+      <td>${p.outbound_layer_code || "—"} <span class="muted">#${p.outbound_layer_id}</span></td>
+      <td>${evs || "—"}</td>
+      <td class="code">${p.created_at}</td>
+      <td>${st}</td>
+      <td>${dl}</td>
+    </tr>`;
+  }).join("");
+}
+
+async function downloadProof(ev, id) {
+  // 用 fetch 下载以便把 409（依据已更正/撤回）在页面上直接说明，而不是打开一段 JSON。
+  ev.preventDefault();
+  try {
+    const resp = await fetch(`/api/proofs/${id}/csv`);
+    if (resp.ok) {
+      const blob = await resp.blob();
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = `proof-${id}.csv`;
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      URL.revokeObjectURL(url);
+      return;
+    }
+    const data = await resp.json().catch(() => ({}));
+    const err = data.error || {};
+    const bad = (err.invalid_evidence || [])
+      .map((x) => `#${x.id} ${x.reason}`).join("；");
+    renderProofMsg("err",
+      `校样 #${id} 不可下载：${err.message || resp.statusText}`
+      + (bad ? `\n失效依据：${bad}` : ""));
+  } catch (e) {
+    renderProofMsg("err", "下载失败：" + e.message);
+  }
+  await refreshProofs();
 }
 
 function loadDemo() {

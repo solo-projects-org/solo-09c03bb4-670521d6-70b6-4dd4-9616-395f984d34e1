@@ -1,15 +1,18 @@
 #!/usr/bin/env bash
-# 三级自测一键脚本（仅需 Python 3.11 标准库；不依赖 FastAPI/docker）。
+# 四级自测一键脚本（仅需 Python 3.11 标准库；不依赖 FastAPI/docker）。
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
-echo "== [1/3] 求解器穷举对照 =="
+echo "== [1/4] 求解器穷举对照 =="
 python3 -I tests/test_solver.py
 
-echo "== [2/3] 服务层端到端 =="
+echo "== [2/4] 服务层端到端 =="
 python3 -I tests/test_services.py
 
-echo "== [3/3] HTTP 级（自动启停标准库垫片）=="
+echo "== [3/4] 校样生成与依据变动 =="
+python3 -I tests/test_proof.py
+
+echo "== [4/4] HTTP 级（自动启停标准库垫片）=="
 DBF="$(mktemp -u /tmp/chrono-selftest.XXXXXX.db)"
 PORT="${PORT:-8011}"
 CHRONO_DB_PATH="$DBF" PORT="$PORT" python3 -I tests/stdlib_server.py &
