@@ -1,0 +1,18 @@
+{
+  "_说明": "示例提交：三个层位、分离候选区间（含空档）、严格早于、同批临时 id 引用。POST /api/submissions。临时 id 按建层顺序分配：T1=-1, T2=-2, T3=-3",
+  "actions": [
+    {"action": "add_layer", "code": "T1", "name": "探方A第1层"},
+    {"action": "add_layer", "code": "T2", "name": "探方A第2层"},
+    {"action": "add_layer", "code": "T3", "name": "探方A第3层"},
+
+    {"action": "add_dating", "layer_id": -1, "lower_year": -1200, "upper_year": -1100, "note": "测年报告R1-样a"},
+    {"action": "add_dating", "layer_id": -1, "lower_year": -950,  "upper_year": -900,  "note": "测年报告R1-样b（分离区间）"},
+    {"action": "add_dating", "layer_id": -2, "lower_year": -1050, "upper_year": -930,  "note": "测年报告R2"},
+    {"action": "add_dating", "layer_id": -3, "lower_year": -920,  "upper_year": -700,  "note": "测年报告R3"},
+
+    {"action": "add_superposition", "earlier_layer_id": -1, "later_layer_id": -2, "note": "T2 叠压 T1"},
+    {"action": "add_superposition", "earlier_layer_id": -2, "later_layer_id": -3, "note": "T3 叠压 T2"},
+
+    {"action": "add_registration", "layer_id": -1, "lower_year": -1300, "upper_year": -1000, "note": "拟采用早段（可后续更换/撤回）"}
+  ]
+}

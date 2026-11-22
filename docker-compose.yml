@@ -1,0 +1,12 @@
+services:
+  web:
+    build: .
+    image: chrono-web:latest
+    container_name: chrono-web
+    ports:
+      - "8000:8000"
+    environment:
+      CHRONO_DB_PATH: /data/chrono.db
+    volumes:
+      - ./data:/data
+    restart: unless-stopped
